@@ -531,7 +531,11 @@ if st.session_state.autenticado and st.session_state.ultimo_acceso:
 if st.session_state.autenticado:
     st.session_state.ultimo_acceso = datetime.now()
 
-LOGO = "static/logo.jpg"
+CARPETA_APP = os.path.dirname(os.path.abspath(__file__))
+LOGO = next((os.path.join(CARPETA_APP, "static", f"logo.{ext}")
+             for ext in ("jpg", "jpeg", "png", "webp")
+             if os.path.exists(os.path.join(CARPETA_APP, "static", f"logo.{ext}"))), "")
+LOGO_MIME = {"png": "image/png", "webp": "image/webp"}.get(LOGO.rsplit(".", 1)[-1], "image/jpeg")
 
 if not st.session_state.autenticado:
     st.markdown(
@@ -557,12 +561,12 @@ if not st.session_state.autenticado:
     _, centro, _ = st.columns([1, 1.1, 1])
     with centro:
         mostrar_aviso()
-        if os.path.exists(LOGO):
+        if LOGO:
             with open(LOGO, "rb") as f:
                 logo64 = base64.b64encode(f.read()).decode("utf-8")
             st.markdown(
                 f"<div style='display:flex;justify-content:center;margin-bottom:0.8rem;'>"
-                f"<img src='data:image/jpeg;base64,{logo64}' width='105' style='border-radius:16px;'></div>",
+                f"<img src='data:{LOGO_MIME};base64,{logo64}' width='105' style='border-radius:16px;'></div>",
                 unsafe_allow_html=True,
             )
         st.markdown(
@@ -586,7 +590,7 @@ if not st.session_state.autenticado:
 # 7. BARRA LATERAL
 # ==========================================
 with st.sidebar:
-    if os.path.exists(LOGO):
+    if LOGO:
         st.image(LOGO, width=110)
     st.markdown(f"### 🏺 {NEGOCIO}")
     st.toggle("🙈 Ocultar cifras", key="ocultar_cifras")
