@@ -34,14 +34,14 @@ import streamlit as st
 # ==========================================
 # 1. CONFIGURACIÓN
 # ==========================================
-NEGOCIO = os.getenv("NEGOCIO_NAME", "Talavera")
-PRIMARY_COLOR = os.getenv("PRIMARY_COLOR", "#2869a1")  # azul del logo (tono oscuro)
-AZUL_LOGO = "#3680b9"                                  # azul del fondo del logo
+NEGOCIO = os.getenv("NEGOCIO_NAME")
+PRIMARY_COLOR = os.getenv("PRIMARY_COLOR")  # azul del logo (tono oscuro)
+AZUL_LOGO = "#3680b9"                       # azul del fondo del logo
 AZUL_OSCURO = "#1d4f7c"
-ACENTO = "#9cc8e8"                                     # azul claro para gastos y detalles
+ACENTO = "#9cc8e8"                          # azul claro para gastos y detalles
 ROJO = "#dc2626"
-ZONA = ZoneInfo(os.getenv("ZONA_HORARIA", "America/Mexico_City"))
-SESION_MINUTOS = int(os.getenv("SESION_MINUTOS", "30"))
+ZONA = ZoneInfo(os.getenv("ZONA_HORARIA"))
+SESION_MINUTOS = int(os.getenv("SESION_MINUTOS"))
 
 st.set_page_config(page_title=f"{NEGOCIO} - Control", page_icon="🏺", layout="wide")
 
