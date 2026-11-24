@@ -352,6 +352,44 @@ def cargar_pedidos(condicion: str = "", params=None) -> pd.DataFrame:
     return consultar_df(SQL_PEDIDOS + condicion + " ORDER BY p.fecha_entrega NULLS LAST, p.id", params)
 
 
+ACENTOS_DE, ACENTOS_A = "áéíóúüñ", "aeiouun"
+
+
+def _sin_acentos(texto: str) -> str:
+    return texto.lower().translate(str.maketrans(ACENTOS_DE, ACENTOS_A))
+
+
+def buscar_piezas(texto: str, limite: int = 20) -> pd.DataFrame:
+    """Busca piezas por nombre, diseño, medida o categoría. Sin importar mayúsculas ni acentos;
+    con varias palabras, la pieza debe tener todas (p. ej. «plato azul»)."""
+    palabras = [p for p in _sin_acentos(texto).split() if p]
+    if not palabras:
+        return pd.DataFrame()
+    campo = (f"translate(lower(p.nombre || ' ' || p.diseno || ' ' || p.medida || ' ' || p.categoria),"
+             f" '{ACENTOS_DE}', '{ACENTOS_A}')")
+    condiciones = " AND ".join([f"{campo} LIKE %s ESCAPE '\\'"] * len(palabras))
+    patrones = ["%" + p.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "%" for p in palabras]
+    sql = f"""
+        SELECT p.id, p.nombre, p.categoria, p.medida, p.diseno, p.existencias, p.stock_minimo,
+               p.costo, p.precio_venta, p.precio_mayoreo, p.activo,
+               COALESCE((SELECT SUM(d.cantidad) FROM pedido_detalle d JOIN pedidos pe ON pe.id = d.pedido_id
+                         WHERE d.producto_id = p.id AND pe.estado NOT IN ('Entregado', 'Cancelado')
+                           AND NOT pe.inventario_descontado), 0) AS en_pedidos,
+               COALESCE((SELECT SUM(m.cantidad) FROM movimientos_inventario m
+                         WHERE m.producto_id = p.id AND m.tipo IN ('VENTA', 'PEDIDO')
+                           AND m.fecha >= %s), 0) AS vendidas_30,
+               (SELECT MAX(m.fecha) FROM movimientos_inventario m
+                 WHERE m.producto_id = p.id AND m.tipo IN ('VENTA', 'PEDIDO')) AS ultima_venta,
+               (SELECT MAX(m.fecha) FROM movimientos_inventario m
+                 WHERE m.producto_id = p.id AND m.tipo = 'ENTRADA') AS ultima_entrada
+        FROM productos p
+        WHERE {condiciones}
+        ORDER BY (lower(p.nombre) = lower(%s)) DESC, p.activo DESC, p.nombre
+        LIMIT {int(limite)}
+    """
+    return consultar_df(sql, [hoy() - timedelta(days=30)] + patrones + [texto.strip()])
+
+
 # ==========================================
 # 4. OPERACIONES DEL NEGOCIO
 # ==========================================
@@ -819,8 +857,8 @@ st.title(f"🏺 {NEGOCIO}")
 st.markdown("<div class='franja-talavera'></div>", unsafe_allow_html=True)
 mostrar_aviso()
 
-tab_resumen, tab_vender, tab_pedidos, tab_inventario, tab_cuentas = st.tabs(
-    ["📊 Resumen", "🛒 Vender", "📋 Pedidos", "🏺 Inventario", "💰 Cuentas"])
+tab_resumen, tab_buscar, tab_vender, tab_pedidos, tab_inventario, tab_cuentas = st.tabs(
+    ["📊 Resumen", "🔎 Buscar", "🛒 Vender", "📋 Pedidos", "🏺 Inventario", "💰 Cuentas"])
 
 # ------------------------------------------
 # TAB: RESUMEN
@@ -934,6 +972,95 @@ with tab_resumen:
             f"valor a costo {dinero(valor_costo, OCULTAR)} · a precio de venta {dinero(valor_venta, OCULTAR)} · "
             f"ganancia en piezas vendidas este mes {dinero(ganancia_piezas, OCULTAR)}"
         )
+
+# ------------------------------------------
+# TAB: BUSCAR PIEZA
+# ------------------------------------------
+def _fecha_txt(f) -> str:
+    return f.strftime("%d/%m/%Y") if f is not None and not pd.isna(f) else "—"
+
+
+def ficha_pieza(r):
+    """Muestra todos los datos de una pieza encontrada."""
+    hay, minimo, en_ped = int(r["existencias"]), int(r["stock_minimo"]), int(r["en_pedidos"])
+    if not r["activo"]:
+        estado = "⚫ Inactiva (ya no se vende)"
+    elif hay == 0:
+        estado = "🔴 Agotada"
+    elif hay <= minimo:
+        estado = "🟡 Por acabarse"
+    else:
+        estado = "🟢 Disponible"
+
+    with st.container(border=True):
+        st.markdown(f"### 🏺 {r['nombre']}")
+        detalles = [f"**Categoría:** {r['categoria']}"]
+        if r["medida"]:
+            detalles.append(f"**Medida:** {r['medida']}")
+        if r["diseno"]:
+            detalles.append(f"**Diseño:** {r['diseno']}")
+        st.markdown(" · ".join(detalles) + f" · {estado}")
+
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("📦 Hay en inventario", hay, help=f"Te avisa cuando queden {minimo} o menos.")
+        c2.metric("📋 En pedidos por entregar", en_ped,
+                  help="Piezas de este modelo en pedidos que aún no se entregan.")
+        libres = hay - en_ped
+        c3.metric("✅ Libres para vender", max(libres, 0),
+                  delta=f"faltan {-libres}" if libres < 0 else None, delta_color="inverse",
+                  help="Las que hay menos las que ya están comprometidas en pedidos.")
+        c4.metric("🛒 Vendidas (30 días)", int(r["vendidas_30"]))
+
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("🏷️ Precio de venta", dinero(r["precio_venta"]))
+        c2.metric("📦 Precio de mayoreo", dinero(r["precio_mayoreo"]) if r["precio_mayoreo"] > 0 else "—")
+        c3.metric("💲 Costo", dinero(r["costo"], OCULTAR))
+        c4.metric("💰 Ganancia por pieza", dinero(r["precio_venta"] - r["costo"], OCULTAR),
+                  help="Precio de venta menos costo.")
+        st.caption(f"Última venta: {_fecha_txt(r['ultima_venta'])} · "
+                   f"Última entrada de piezas: {_fecha_txt(r['ultima_entrada'])}")
+
+        pedidos_pieza = consultar_df(
+            "SELECT pe.id, pe.cliente, pe.fecha_entrega, pe.estado, d.cantidad FROM pedido_detalle d"
+            " JOIN pedidos pe ON pe.id = d.pedido_id WHERE d.producto_id = %s"
+            " AND pe.estado NOT IN ('Entregado', 'Cancelado') AND NOT pe.inventario_descontado"
+            " ORDER BY pe.fecha_entrega NULLS LAST", (int(r["id"]),))
+        movs = consultar_df(
+            'SELECT fecha AS "Fecha", tipo AS "Tipo", cantidad AS "Cantidad", nota AS "Nota"'
+            " FROM movimientos_inventario WHERE producto_id = %s ORDER BY fecha DESC, id DESC LIMIT 10",
+            (int(r["id"]),))
+        if not pedidos_pieza.empty:
+            with st.expander(f"📋 Pedidos que la llevan ({len(pedidos_pieza)})"):
+                st.dataframe(pd.DataFrame({
+                    "Folio": pedidos_pieza["id"].map(folio), "Cliente": pedidos_pieza["cliente"],
+                    "Piezas": pedidos_pieza["cantidad"], "Entrega": pedidos_pieza["fecha_entrega"],
+                    "Estado": pedidos_pieza["estado"],
+                }), hide_index=True, use_container_width=True)
+        if not movs.empty:
+            with st.expander("📅 Últimos movimientos"):
+                st.dataframe(movs, hide_index=True, use_container_width=True)
+
+
+with tab_buscar:
+    st.subheader("🔎 Buscar pieza")
+    texto_busqueda = st.text_input(
+        "¿Qué pieza buscas?", key="buscar_texto", placeholder="Ej. plato pozolero, jarrón, azul, 25 cm",
+        help="Escribe el nombre o parte de él. También busca por diseño, medida y categoría. "
+             "No importan mayúsculas ni acentos; con varias palabras muestra las piezas que tengan todas.")
+    if texto_busqueda.strip():
+        encontradas = buscar_piezas(texto_busqueda)
+        if encontradas.empty:
+            st.warning(f"No hay ninguna pieza que coincida con «{texto_busqueda.strip()}». "
+                       "Revisa cómo se escribe o búscala con menos palabras. Si es nueva, dala de alta "
+                       "en 🏺 Inventario.")
+        else:
+            n = len(encontradas)
+            st.caption(f"{n} pieza{'s' if n != 1 else ''} encontrada{'s' if n != 1 else ''}"
+                       + (" (se muestran las primeras 20; escribe algo más específico)" if n >= 20 else ""))
+            for _, fila_pieza in encontradas.iterrows():
+                ficha_pieza(fila_pieza)
+    else:
+        st.caption("Escribe arriba y presiona Enter.")
 
 # ------------------------------------------
 # TAB: VENDER
