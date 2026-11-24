@@ -34,8 +34,8 @@ import streamlit as st
 # ==========================================
 # 1. CONFIGURACIÓN
 # ==========================================
-NEGOCIO = os.getenv("NEGOCIO_NAME")
-PRIMARY_COLOR = os.getenv("PRIMARY_COLOR")  # azul del logo (tono oscuro)
+NEGOCIO = os.getenv("NEGOCIO_NAME", "Talavera")
+PRIMARY_COLOR = os.getenv("PRIMARY_COLOR", "#2869a1")  # azul del logo (tono oscuro)
 AZUL_LOGO = "#3680b9"                                  # azul del fondo del logo
 AZUL_OSCURO = "#1d4f7c"
 ACENTO = "#9cc8e8"                                     # azul claro para gastos y detalles
@@ -131,6 +131,47 @@ def link_whatsapp(telefono: str, mensaje: str):
     if len(digitos) < 11:
         return None
     return f"https://wa.me/{digitos}?text={quote(mensaje)}"
+
+
+DIAS_SEMANA = ["lunes", "martes", "miércoles", "jueves", "viernes", "sábado", "domingo"]
+
+
+def texto_pedido_equipo(pedido_id: int, con_precios: bool) -> str:
+    """Mensaje listo para mandar al grupo de WhatsApp del personal."""
+    p = cargar_pedidos(" WHERE p.id = %s", (pedido_id,)).iloc[0]
+    piezas = consultar("SELECT descripcion, cantidad, precio_unitario FROM pedido_detalle"
+                       " WHERE pedido_id = %s ORDER BY id", (pedido_id,))
+    titulo = (f"NUEVO PEDIDO {folio(pedido_id)}" if p["estado"] == "Pendiente"
+              else f"PEDIDO {folio(pedido_id)} · {p['estado'].upper()}")
+    lineas = [f"📋 *{titulo}*", f"👤 Cliente: {p['cliente']}"]
+    entrega = p["fecha_entrega"]
+    if entrega is not None and not pd.isna(entrega):
+        dias = (entrega - hoy()).days
+        cuando = ("hoy" if dias == 0 else "mañana" if dias == 1 else
+                  f"atrasado {-dias} día(s)" if dias < 0 else f"en {dias} días")
+        lineas.append(f"📅 Entrega: {DIAS_SEMANA[entrega.weekday()]} {entrega.strftime('%d/%m/%Y')} ({cuando})")
+    else:
+        lineas.append("📅 Entrega: sin fecha")
+    lineas.append("🏺 Piezas:")
+    for desc, cant, precio in piezas:
+        lineas.append(f"• {cant} × {desc}" + (f" — {dinero(precio)} c/u" if con_precios else ""))
+    if p["notas"]:
+        lineas.append(f"📝 Notas: {p['notas']}")
+    if con_precios:
+        lineas.append(f"💰 Total {dinero(p['total'])} · Pagado {dinero(p['pagado'])} · Saldo {dinero(p['saldo'])}")
+    return "\n".join(lineas)
+
+
+def panel_compartir(pedido_id: int, clave: str):
+    """Muestra el mensaje del pedido y un botón para mandarlo por WhatsApp (ella elige el grupo)."""
+    con_precios = st.checkbox("Incluir precios y saldo en el mensaje", value=False, key=f"precios_{clave}",
+                              help="Déjalo sin marcar si el personal no necesita ver cuánto cuesta.")
+    mensaje = texto_pedido_equipo(pedido_id, con_precios)
+    st.code(mensaje, language=None)
+    st.link_button("📤 Compartir por WhatsApp con el equipo", f"https://wa.me/?text={quote(mensaje)}",
+                   use_container_width=True, type="primary")
+    st.caption("Se abre WhatsApp para que elijas el grupo o la persona. También puedes copiar el texto "
+               "con el ícono de la esquina del recuadro.")
 
 
 def meses_recientes(n: int = 12):
@@ -263,9 +304,17 @@ CREATE INDEX IF NOT EXISTS idx_mov_fecha ON movimientos_inventario(fecha);
 """
 
 
+TABLAS = ["productos", "pedidos", "pedido_detalle", "caja", "movimientos_inventario"]
+
+
 @st.cache_resource
 def init_db():
+    """Crea las tablas solo si faltan. Si ya existen no hace nada, así la app puede conectarse
+    con un usuario limitado que no tiene permiso de crear tablas."""
     with transaccion() as cur:
+        cur.execute("SELECT bool_and(to_regclass(t) IS NOT NULL) FROM unnest(%s::text[]) AS t", (TABLAS,))
+        if cur.fetchone()[0]:
+            return True
         cur.execute(ESQUEMA)
     return True
 
@@ -927,6 +976,13 @@ with tab_pedidos:
         ["➕ Nuevo pedido", "📋 Activos", "💵 Cobrar / actualizar", "📁 Historial"])
 
     with sub_nuevo:
+        if "pedido_recien" in st.session_state:
+            with st.container(border=True):
+                st.markdown(f"**📤 Avisa al equipo del pedido {folio(st.session_state.pedido_recien)}**")
+                panel_compartir(st.session_state.pedido_recien, "recien")
+                if st.button("Listo, ocultar", key="ocultar_recien"):
+                    del st.session_state["pedido_recien"]
+                    st.rerun()
         prods = cargar_productos()
         mapa = {r["nombre"]: r for r in prods.to_dict("records")}
         version = st.session_state.get("pedido_version", 0)
@@ -978,6 +1034,7 @@ with tab_pedidos:
                 pid = crear_pedido(cliente.strip(), telefono.strip(), fecha_ped, fecha_ent,
                                    notas_p.strip(), lineas, anticipo, metodo_a)
                 st.session_state.pedido_version = version + 1
+                st.session_state.pedido_recien = pid
                 avisar(f"✅ Pedido {folio(pid)} de {cliente.strip()} guardado por {dinero(total_p)}.")
                 st.rerun()
 
@@ -1097,6 +1154,9 @@ with tab_pedidos:
                                              f"Le recordamos que su pedido {folio(pid)} tiene un saldo de "
                                              f"{dinero(p['saldo'])}. ¡Gracias!")
                     c2.link_button("📲 Recordar saldo por WhatsApp", recordar, use_container_width=True)
+
+            with st.expander("📤 Compartir este pedido con el equipo"):
+                panel_compartir(pid, f"detalle_{pid}")
 
     with sub_historial:
         c1, c2 = st.columns([2, 1])
