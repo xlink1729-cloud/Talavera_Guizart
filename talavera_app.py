@@ -312,10 +312,17 @@ def init_db():
     """Crea las tablas solo si faltan. Si ya existen no hace nada, así la app puede conectarse
     con un usuario limitado que no tiene permiso de crear tablas."""
     with transaccion() as cur:
-        cur.execute("SELECT bool_and(to_regclass(t) IS NOT NULL) FROM unnest(%s::text[]) AS t", (TABLAS,))
-        if cur.fetchone()[0]:
-            return True
-        cur.execute(ESQUEMA)
+        cur.execute("SELECT t FROM unnest(%s::text[]) AS t WHERE to_regclass(t) IS NULL", (TABLAS,))
+        faltantes = [f[0] for f in cur.fetchall()]
+    if not faltantes:
+        return True
+    try:
+        with transaccion() as cur:
+            cur.execute(ESQUEMA)
+    except psycopg2.errors.InsufficientPrivilege:
+        st.error(f"🛠️ Falta crear en la base: {', '.join(faltantes)}. El usuario de la app no tiene permiso "
+                 "para crear tablas: el administrador debe correr esquema.sql en Neon con el usuario dueño.")
+        st.stop()
     return True
 
 
@@ -494,6 +501,27 @@ def cambiar_estado_pedido(pedido_id, estado, descontar, fecha):
                             f"Pedido {folio(pedido_id)}", fecha)
             cur.execute("UPDATE pedidos SET inventario_descontado = TRUE WHERE id = %s", (pedido_id,))
         cur.execute("UPDATE pedidos SET estado = %s WHERE id = %s", (estado, pedido_id))
+
+
+def editar_pedido(pedido_id, cliente, telefono, fecha_entrega, notas, lineas=None):
+    """Cambia los datos del pedido. Si se pasan líneas, reemplaza las piezas y recalcula el total."""
+    with transaccion() as cur:
+        cur.execute("SELECT inventario_descontado FROM pedidos WHERE id = %s FOR UPDATE", (pedido_id,))
+        descontado = cur.fetchone()[0]
+        cur.execute("UPDATE pedidos SET cliente = %s, telefono = %s, fecha_entrega = %s, notas = %s WHERE id = %s",
+                    (cliente, telefono, fecha_entrega, notas, pedido_id))
+        if lineas is not None:
+            if descontado:
+                raise ValueError("Las piezas de este pedido ya se descontaron del inventario; ya no se pueden cambiar.")
+            cur.execute("DELETE FROM pedido_detalle WHERE pedido_id = %s", (pedido_id,))
+            for l in lineas:
+                cur.execute(
+                    "INSERT INTO pedido_detalle (pedido_id, producto_id, descripcion, cantidad, precio_unitario)"
+                    " VALUES (%s, %s, %s, %s, %s)",
+                    (pedido_id, l["producto_id"], l["descripcion"][:255], l["cantidad"], l["precio"]),
+                )
+            cur.execute("UPDATE pedidos SET total = %s WHERE id = %s",
+                        (sum(l["subtotal"] for l in lineas), pedido_id))
 
 
 def registrar_caja(fecha, tipo, categoria, concepto, monto, metodo):
@@ -918,9 +946,13 @@ with tab_vender:
     else:
         mapa = {r["nombre"]: r for r in prods.to_dict("records")}
         c1, c2, c3 = st.columns(3)
-        fecha_v = c1.date_input("Fecha", value=hoy(), key="venta_fecha", format="DD/MM/YYYY")
-        metodo_v = c2.selectbox("Forma de pago", METODOS_PAGO, key="venta_metodo")
-        mayoreo = c3.toggle("Precio de mayoreo", key="venta_mayoreo")
+        fecha_v = c1.date_input("Fecha", value=hoy(), key="venta_fecha", format="DD/MM/YYYY",
+                                help="Día de la venta. Cámbialo solo si estás anotando una venta de otro día.")
+        metodo_v = c2.selectbox("Forma de pago", METODOS_PAGO, key="venta_metodo",
+                                help="Cómo pagó el cliente. Sirve para que cuadre el corte de caja.")
+        mayoreo = c3.toggle("Precio de mayoreo", key="venta_mayoreo",
+                            help="Actívalo si el cliente compra al mayoreo: se usa el precio de mayoreo de cada "
+                                 "pieza (si no tiene, se usa el normal).")
 
         st.caption("Agrega una fila por pieza. Si dejas el precio vacío se usa el precio de lista.")
         version = st.session_state.get("venta_version", 0)
@@ -928,9 +960,13 @@ with tab_vender:
             tabla_vacia(con_descripcion=False), key=f"venta_editor_{version}", num_rows="dynamic",
             hide_index=True, use_container_width=True,
             column_config={
-                "Pieza": st.column_config.SelectboxColumn("Pieza", options=list(mapa.keys()), width="large"),
-                "Cantidad": st.column_config.NumberColumn("Cantidad", min_value=1, step=1, default=1),
-                "Precio c/u": st.column_config.NumberColumn("Precio c/u", min_value=0.0, step=1.0, format="$%.2f"),
+                "Pieza": st.column_config.SelectboxColumn("Pieza", options=list(mapa.keys()), width="large",
+                                                          help="Toca la celda y elige la pieza del catálogo."),
+                "Cantidad": st.column_config.NumberColumn("Cantidad", min_value=1, step=1, default=1,
+                                                          help="Cuántas piezas se lleva."),
+                "Precio c/u": st.column_config.NumberColumn(
+                    "Precio c/u", min_value=0.0, step=1.0, format="$%.2f",
+                    help="Déjalo vacío para usar el precio de lista. Escríbelo solo si hiciste descuento."),
             },
         )
         lineas, avisos = armar_lineas(capturado, mapa, mayoreo)
@@ -949,9 +985,17 @@ with tab_vender:
             resumen_lineas(lineas)
             st.markdown(f"## Total: {dinero(total_v)}")
         nota_v = st.text_input("Nota (opcional)", key=f"venta_nota_{version}",
-                               placeholder="Ej. cliente de Puebla, se llevó envuelto")
-        if st.button("✅ Registrar venta", type="primary", use_container_width=True,
-                     disabled=not lineas or bool(avisos)):
+                               placeholder="Ej. cliente de Puebla, se llevó envuelto",
+                               help="Cualquier dato que quieras recordar de esta venta. Aparece en el corte de caja.")
+        col_ok, col_cancel = st.columns([2, 1])
+        if col_cancel.button("❌ Cancelar venta", use_container_width=True, key=f"venta_cancelar_{version}",
+                             help="Borra lo que capturaste sin registrar nada."):
+            st.session_state.venta_version = version + 1
+            avisar("Venta cancelada, no se registró nada.", "info")
+            st.rerun()
+        if col_ok.button("✅ Registrar venta", type="primary", use_container_width=True,
+                         disabled=not lineas or bool(avisos),
+                         help="Descuenta las piezas del inventario y anota el cobro en caja."):
             try:
                 total_v = registrar_venta(lineas, metodo_v, fecha_v, nota_v.strip())
                 st.session_state.venta_version = version + 1
@@ -987,12 +1031,17 @@ with tab_pedidos:
         mapa = {r["nombre"]: r for r in prods.to_dict("records")}
         version = st.session_state.get("pedido_version", 0)
         c1, c2 = st.columns(2)
-        cliente = c1.text_input("Cliente *", key=f"np_cliente_{version}")
-        telefono = c2.text_input("Teléfono / WhatsApp", key=f"np_tel_{version}", placeholder="10 dígitos")
+        cliente = c1.text_input("Cliente *", key=f"np_cliente_{version}",
+                                help="Nombre de quien hace el pedido. Es obligatorio.")
+        telefono = c2.text_input("Teléfono / WhatsApp", key=f"np_tel_{version}", placeholder="10 dígitos",
+                                 help="Opcional. Con él aparecen los botones para avisarle por WhatsApp "
+                                      "cuando esté listo o recordarle el saldo.")
         c1, c2 = st.columns(2)
-        fecha_ped = c1.date_input("Fecha del pedido", value=hoy(), key=f"np_fecha_{version}", format="DD/MM/YYYY")
+        fecha_ped = c1.date_input("Fecha del pedido", value=hoy(), key=f"np_fecha_{version}", format="DD/MM/YYYY",
+                                  help="Día en que el cliente hizo el pedido. El anticipo se anota en esta fecha.")
         fecha_ent = c2.date_input("Fecha de entrega", value=hoy() + timedelta(days=15),
-                                  key=f"np_entrega_{version}", format="DD/MM/YYYY")
+                                  key=f"np_entrega_{version}", format="DD/MM/YYYY",
+                                  help="Día prometido al cliente. La app avisa cuando se acerca o ya pasó.")
 
         st.caption("Elige piezas del catálogo o «Pieza personalizada» y descríbela (diseño, colores, medida).")
         capturado = st.data_editor(
@@ -1000,10 +1049,16 @@ with tab_pedidos:
             hide_index=True, use_container_width=True,
             column_config={
                 "Pieza": st.column_config.SelectboxColumn(
-                    "Pieza", options=[PERSONALIZADA] + list(mapa.keys()), width="medium"),
-                "Descripción": st.column_config.TextColumn("Descripción", width="large"),
-                "Cantidad": st.column_config.NumberColumn("Cantidad", min_value=1, step=1, default=1),
-                "Precio c/u": st.column_config.NumberColumn("Precio c/u", min_value=0.0, step=1.0, format="$%.2f"),
+                    "Pieza", options=[PERSONALIZADA] + list(mapa.keys()), width="medium",
+                    help="Elige una pieza del catálogo, o «Pieza personalizada» si se hará especial."),
+                "Descripción": st.column_config.TextColumn(
+                    "Descripción", width="large",
+                    help="Obligatoria en piezas personalizadas: diseño, colores, medida, nombre que lleva..."),
+                "Cantidad": st.column_config.NumberColumn("Cantidad", min_value=1, step=1, default=1,
+                                                          help="Cuántas piezas de este tipo."),
+                "Precio c/u": st.column_config.NumberColumn(
+                    "Precio c/u", min_value=0.0, step=1.0, format="$%.2f",
+                    help="En piezas del catálogo, vacío = precio de lista. En personalizadas escribe el precio."),
             },
         )
         lineas, avisos = armar_lineas(capturado, mapa)
@@ -1016,14 +1071,26 @@ with tab_pedidos:
 
         c1, c2 = st.columns(2)
         anticipo = c1.number_input("Anticipo recibido", min_value=0.0, step=50.0, format="%.2f",
-                                   key=f"np_anticipo_{version}")
-        metodo_a = c2.selectbox("Forma de pago del anticipo", METODOS_PAGO, key=f"np_metodo_{version}")
+                                   key=f"np_anticipo_{version}",
+                                   help="Lo que el cliente dejó a cuenta. Déjalo en 0 si no dejó nada; "
+                                        "los pagos siguientes se anotan en «Cobrar / actualizar».")
+        metodo_a = c2.selectbox("Forma de pago del anticipo", METODOS_PAGO, key=f"np_metodo_{version}",
+                                help="Cómo pagó el anticipo.")
         if lineas:
             st.caption(f"Saldo pendiente: **{dinero(total_p - anticipo)}**")
         notas_p = st.text_area("Notas del pedido", key=f"np_notas_{version}",
-                               placeholder="Ej. lleva su nombre al centro, colores azul y amarillo")
+                               placeholder="Ej. lleva su nombre al centro, colores azul y amarillo",
+                               help="Detalles para el taller. Aparecen en el mensaje que se comparte con el equipo.")
 
-        if st.button("💾 Guardar pedido", type="primary", use_container_width=True):
+        col_ok, col_cancel = st.columns([2, 1])
+        if col_cancel.button("❌ Cancelar pedido", use_container_width=True, key=f"np_cancelar_{version}",
+                             help="Borra lo que capturaste sin guardar nada (por ejemplo, si el cliente "
+                                  "ya no quiso hacer el pedido)."):
+            st.session_state.pedido_version = version + 1
+            avisar("Pedido cancelado, no se guardó nada.", "info")
+            st.rerun()
+        if col_ok.button("💾 Guardar pedido", type="primary", use_container_width=True,
+                         help="Guarda el pedido y, si hay anticipo, lo anota en caja."):
             if not cliente.strip():
                 st.error("Escribe el nombre del cliente.")
             elif not lineas:
@@ -1066,7 +1133,8 @@ with tab_pedidos:
             st.caption(f"{len(activos)} pedido(s) · por cobrar {dinero(activos['saldo'].clip(lower=0).sum(), OCULTAR)}")
 
     with sub_cobrar:
-        mostrar_todos = st.checkbox("Mostrar también pedidos entregados y pagados")
+        mostrar_todos = st.checkbox("Mostrar también pedidos entregados y pagados",
+            help="Normalmente solo aparecen los pedidos que falta entregar o cobrar.")
         todos = cargar_pedidos(" WHERE p.estado <> 'Cancelado'")
         if not mostrar_todos and not todos.empty:
             todos = todos[(todos["estado"] != "Entregado") | (todos["saldo"] > 0.005)]
@@ -1076,7 +1144,8 @@ with tab_pedidos:
             etiquetas = {
                 int(r["id"]): f"{folio(r['id'])} · {r['cliente']} · {r['estado']} · saldo {dinero(r['saldo'])}"
                 for _, r in todos.iterrows()}
-            pid = st.selectbox("Pedido", list(etiquetas.keys()), format_func=etiquetas.get)
+            pid = st.selectbox("Pedido", list(etiquetas.keys()), format_func=etiquetas.get,
+                help="Elige el pedido para ver sus piezas, cobrar, cambiar su estado o modificarlo.")
             p = todos[todos["id"] == pid].iloc[0]
 
             st.markdown(f"### Pedido {folio(pid)} · {p['cliente']}")
@@ -1107,9 +1176,13 @@ with tab_pedidos:
                 with st.form(f"abono_{pid}"):
                     st.markdown("**💵 Registrar pago**")
                     monto = st.number_input("Monto", min_value=0.0, step=50.0, format="%.2f",
-                                            value=float(max(p["saldo"], 0)))
-                    metodo_ab = st.selectbox("Forma de pago", METODOS_PAGO)
-                    fecha_ab = st.date_input("Fecha", value=hoy(), format="DD/MM/YYYY")
+                                            value=float(max(p["saldo"], 0)),
+                                            help="Ya viene con el saldo completo. Cámbialo si el cliente "
+                                                 "solo dejó una parte.")
+                    metodo_ab = st.selectbox("Forma de pago", METODOS_PAGO,
+                        help="Cómo pagó el cliente este abono.")
+                    fecha_ab = st.date_input("Fecha", value=hoy(), format="DD/MM/YYYY",
+                        help="Día en que se recibió el pago.")
                     if st.form_submit_button("Registrar pago", use_container_width=True):
                         if monto <= 0:
                             st.error("Escribe un monto mayor a cero.")
@@ -1125,7 +1198,10 @@ with tab_pedidos:
                 with st.form(f"estado_{pid}"):
                     st.markdown("**🔄 Cambiar estado**")
                     nuevo_estado = st.selectbox("Estado", ESTADOS_PEDIDO, index=ESTADOS_PEDIDO.index(p["estado"])
-                                                if p["estado"] in ESTADOS_PEDIDO else 0)
+                                                if p["estado"] in ESTADOS_PEDIDO else 0,
+                                                help="En qué va el pedido. Si el cliente ya no lo quiere, "
+                                                     "elige «Cancelado»: deja de contar como pendiente y "
+                                                     "por cobrar, pero queda en el historial.")
                     descontar = False
                     if lleva_catalogo and not p["inventario_descontado"]:
                         descontar = st.checkbox(
@@ -1155,13 +1231,95 @@ with tab_pedidos:
                                              f"{dinero(p['saldo'])}. ¡Gracias!")
                     c2.link_button("📲 Recordar saldo por WhatsApp", recordar, use_container_width=True)
 
+            with st.expander("✏️ Modificar pedido"):
+                ver_ed = st.session_state.get(f"edit_ver_{pid}", 0)
+                prods_ed = cargar_productos()
+                mapa_ed = {r["nombre"]: r for r in prods_ed.to_dict("records")}
+                id_a_nombre = {int(r["id"]): r["nombre"] for r in prods_ed.to_dict("records")}
+                c1, c2 = st.columns(2)
+                ed_cliente = c1.text_input("Cliente", value=p["cliente"], key=f"ed_cli_{pid}_{ver_ed}",
+                                           help="Corrige el nombre si se escribió mal.")
+                ed_tel = c2.text_input("Teléfono / WhatsApp", value=p["telefono"], key=f"ed_tel_{pid}_{ver_ed}",
+                                       help="10 dígitos. Se usa para los botones de WhatsApp al cliente.")
+                tiene_fecha = p["fecha_entrega"] is not None and not pd.isna(p["fecha_entrega"])
+                ed_entrega = st.date_input("Fecha de entrega", value=p["fecha_entrega"] if tiene_fecha else None,
+                                           key=f"ed_ent_{pid}_{ver_ed}", format="DD/MM/YYYY",
+                                           help="Cámbiala si se acordó otra fecha con el cliente.")
+                ed_notas = st.text_area("Notas", value=p["notas"], key=f"ed_notas_{pid}_{ver_ed}",
+                                        help="Detalles para el taller.")
+
+                lineas_ed = None
+                if p["inventario_descontado"]:
+                    st.info("Las piezas ya se descontaron del inventario al entregar, así que solo se pueden "
+                            "cambiar los datos de arriba.")
+                else:
+                    filas = consultar("SELECT producto_id, descripcion, cantidad, precio_unitario FROM pedido_detalle"
+                                      " WHERE pedido_id = %s ORDER BY id", (pid,))
+                    actual = pd.DataFrame({
+                        "Pieza": pd.Series([id_a_nombre.get(int(f[0]), PERSONALIZADA) if f[0] is not None
+                                            else PERSONALIZADA for f in filas], dtype="object"),
+                        "Descripción": pd.Series([f[1] for f in filas], dtype="object"),
+                        "Cantidad": pd.Series([int(f[2]) for f in filas], dtype="int64"),
+                        "Precio c/u": pd.Series([float(f[3]) for f in filas], dtype="float64"),
+                    })
+                    st.caption("Piezas del pedido: puedes cambiar cantidades y precios, agregar filas o borrar "
+                               "las que sobren.")
+                    capturado_ed = st.data_editor(
+                        actual, key=f"ed_piezas_{pid}_{ver_ed}", num_rows="dynamic", hide_index=True,
+                        use_container_width=True,
+                        column_config={
+                            "Pieza": st.column_config.SelectboxColumn(
+                                "Pieza", options=[PERSONALIZADA] + list(mapa_ed.keys()), width="medium"),
+                            "Descripción": st.column_config.TextColumn("Descripción", width="large"),
+                            "Cantidad": st.column_config.NumberColumn("Cantidad", min_value=1, step=1, default=1),
+                            "Precio c/u": st.column_config.NumberColumn("Precio c/u", min_value=0.0, step=1.0,
+                                                                        format="$%.2f"),
+                        },
+                    )
+                    lineas_ed, avisos_ed = armar_lineas(capturado_ed, mapa_ed)
+                    for a in avisos_ed:
+                        st.warning(a)
+                    nuevo_total = sum(l["subtotal"] for l in lineas_ed)
+                    st.markdown(f"**Nuevo total: {dinero(nuevo_total)}** (antes {dinero(p['total'])}) · "
+                                f"nuevo saldo: {dinero(nuevo_total - p['pagado'])}")
+                    if nuevo_total < p["pagado"] - 0.005:
+                        st.warning(f"El cliente ya pagó {dinero(p['pagado'])}, más que el nuevo total. "
+                                   "Si le devuelves la diferencia, regístrala en 💰 Cuentas como «Devolución a cliente».")
+
+                col_ok, col_cancel = st.columns([2, 1])
+                if col_cancel.button("↩️ Descartar cambios", key=f"ed_descartar_{pid}_{ver_ed}",
+                                     use_container_width=True,
+                                     help="Deja el pedido como estaba, sin guardar lo que cambiaste aquí."):
+                    st.session_state[f"edit_ver_{pid}"] = ver_ed + 1
+                    avisar(f"Cambios descartados. El pedido {folio(pid)} quedó como estaba.", "info")
+                    st.rerun()
+                if col_ok.button("💾 Guardar cambios del pedido", key=f"ed_guardar_{pid}_{ver_ed}",
+                                 use_container_width=True, type="primary",
+                                 help="Guarda los cambios. El total y el saldo se recalculan solos."):
+                    if not ed_cliente.strip():
+                        st.error("El pedido necesita el nombre del cliente.")
+                    elif lineas_ed is not None and not lineas_ed:
+                        st.error("El pedido debe tener al menos una pieza. Si ya no va, cámbialo a «Cancelado».")
+                    else:
+                        try:
+                            editar_pedido(pid, ed_cliente.strip(), ed_tel.strip(), ed_entrega,
+                                          ed_notas.strip(), lineas_ed)
+                            st.session_state[f"edit_ver_{pid}"] = ver_ed + 1
+                            avisar(f"✅ Pedido {folio(pid)} actualizado. Si cambió algo importante, compártelo "
+                                   "otra vez con el equipo.")
+                            st.rerun()
+                        except ValueError as e:
+                            st.error(str(e))
+
             with st.expander("📤 Compartir este pedido con el equipo"):
                 panel_compartir(pid, f"detalle_{pid}")
 
     with sub_historial:
         c1, c2 = st.columns([2, 1])
-        buscar = c1.text_input("Buscar cliente", key="hist_buscar")
-        estados = c2.multiselect("Estado", ESTADOS_PEDIDO, default=[], key="hist_estados")
+        buscar = c1.text_input("Buscar cliente", key="hist_buscar",
+            help="Escribe parte del nombre del cliente.")
+        estados = c2.multiselect("Estado", ESTADOS_PEDIDO, default=[], key="hist_estados",
+            help="Déjalo vacío para ver todos los estados.")
         hist = cargar_pedidos()
         if not hist.empty:
             if buscar:
@@ -1199,19 +1357,27 @@ with tab_inventario:
     with st.expander("➕ Dar de alta una pieza nueva", expanded=todos_prods.empty):
         with st.form("nueva_pieza", clear_on_submit=True):
             c1, c2 = st.columns(2)
-            n_nombre = c1.text_input("Nombre de la pieza *", placeholder="Ej. Plato pozolero flor azul")
-            n_cat = c2.selectbox("Categoría", CATEGORIAS)
+            n_nombre = c1.text_input("Nombre de la pieza *", placeholder="Ej. Plato pozolero flor azul",
+                help="Nombre con el que la vas a buscar al vender. No puede repetirse.")
+            n_cat = c2.selectbox("Categoría", CATEGORIAS,
+                help="Sirve para agrupar y filtrar el catálogo.")
             c1, c2 = st.columns(2)
-            n_medida = c1.text_input("Medida / tamaño", placeholder="Ej. 25 cm, mediano")
-            n_diseno = c2.text_input("Diseño / colores", placeholder="Ej. azul cobalto, colonial")
+            n_medida = c1.text_input("Medida / tamaño", placeholder="Ej. 25 cm, mediano",
+                help="Opcional.")
+            n_diseno = c2.text_input("Diseño / colores", placeholder="Ej. azul cobalto, colonial",
+                help="Opcional. También se puede buscar por diseño.")
             c1, c2 = st.columns(2)
-            n_exist = c1.number_input("Piezas que hay ahorita", min_value=0, step=1)
-            n_min = c2.number_input("Avisarme cuando queden", min_value=0, value=2, step=1)
+            n_exist = c1.number_input("Piezas que hay ahorita", min_value=0, step=1,
+                help="Cuántas hay terminadas y listas para vender en este momento.")
+            n_min = c2.number_input("Avisarme cuando queden", min_value=0, value=2, step=1,
+                help="Cuando queden estas piezas o menos, aparece el aviso de «por acabarse».")
             c1, c2, c3 = st.columns(3)
             n_costo = c1.number_input("Costo por pieza", min_value=0.0, step=5.0, format="%.2f",
                                       help="Lo que cuesta hacerla o comprarla.")
-            n_precio = c2.number_input("Precio de venta", min_value=0.0, step=5.0, format="%.2f")
-            n_mayoreo = c3.number_input("Precio de mayoreo (opcional)", min_value=0.0, step=5.0, format="%.2f")
+            n_precio = c2.number_input("Precio de venta", min_value=0.0, step=5.0, format="%.2f",
+                help="Precio normal al público. Se usa al vender si no escribes otro.")
+            n_mayoreo = c3.number_input("Precio de mayoreo (opcional)", min_value=0.0, step=5.0, format="%.2f",
+                help="Déjalo en 0 si no manejas mayoreo para esta pieza.")
             if st.form_submit_button("💾 Guardar pieza", use_container_width=True):
                 if not n_nombre.strip():
                     st.error("La pieza necesita un nombre.")
@@ -1227,13 +1393,17 @@ with tab_inventario:
     if nombres_activos:
         with st.expander("📥 Entraron piezas (salieron del horno o se compraron)"):
             with st.form("entrada_piezas", clear_on_submit=True):
-                e_pieza = st.selectbox("Pieza", list(nombres_activos.keys()))
+                e_pieza = st.selectbox("Pieza", list(nombres_activos.keys()),
+                    help="La pieza que entró. Si es nueva, primero dala de alta.")
                 c1, c2, c3 = st.columns(3)
-                e_cant = c1.number_input("Cantidad", min_value=1, step=1)
+                e_cant = c1.number_input("Cantidad", min_value=1, step=1,
+                    help="Cuántas piezas buenas entraron (sin contar las que salieron quebradas).")
                 e_costo = c2.number_input("Costo por pieza (opcional)", min_value=0.0, step=5.0, format="%.2f",
                                           help="Si lo dejas en 0 se queda el costo que ya tenía.")
-                e_fecha = c3.date_input("Fecha", value=hoy(), format="DD/MM/YYYY")
-                e_nota = st.text_input("Nota", placeholder="Ej. hornada del martes")
+                e_fecha = c3.date_input("Fecha", value=hoy(), format="DD/MM/YYYY",
+                    help="Día en que entraron las piezas.")
+                e_nota = st.text_input("Nota", placeholder="Ej. hornada del martes",
+                    help="Opcional.")
                 if st.form_submit_button("📥 Sumar al inventario", use_container_width=True):
                     entrada_producto(nombres_activos[e_pieza], int(e_cant), e_costo, e_fecha, e_nota.strip())
                     avisar(f"📥 Se sumaron {int(e_cant)} «{e_pieza}».")
@@ -1241,13 +1411,19 @@ with tab_inventario:
 
         with st.expander("💥 Piezas quebradas o corregir conteo"):
             with st.form("merma_ajuste", clear_on_submit=True):
-                m_pieza = st.selectbox("Pieza", list(nombres_activos.keys()))
+                m_pieza = st.selectbox("Pieza", list(nombres_activos.keys()),
+                    help="La pieza que se quebró o que contaste.")
                 m_tipo = st.radio("¿Qué pasó?", ["💥 Se quebraron / dañaron", "🔢 Conté y hay otra cantidad"],
-                                  horizontal=True)
+                                  horizontal=True,
+                                  help="Quebradas: se restan del inventario. Conteo: el inventario queda "
+                                       "con el número que escribas.")
                 c1, c2 = st.columns(2)
-                m_cant = c1.number_input("Cantidad (quebradas, o las que hay realmente)", min_value=0, step=1)
-                m_fecha = c2.date_input("Fecha", value=hoy(), format="DD/MM/YYYY")
-                m_nota = st.text_input("Nota", placeholder="Ej. se cayó el anaquel")
+                m_cant = c1.number_input("Cantidad (quebradas, o las que hay realmente)", min_value=0, step=1,
+                    help="Si se quebraron: cuántas. Si contaste: el total que hay en realidad.")
+                m_fecha = c2.date_input("Fecha", value=hoy(), format="DD/MM/YYYY",
+                    help="Día en que pasó.")
+                m_nota = st.text_input("Nota", placeholder="Ej. se cayó el anaquel",
+                    help="Opcional, para recordar qué pasó.")
                 if st.form_submit_button("Guardar", use_container_width=True):
                     try:
                         if m_tipo.startswith("💥"):
@@ -1266,27 +1442,38 @@ with tab_inventario:
         with st.expander("✏️ Editar o eliminar una pieza"):
             ids = {int(r["id"]): r["nombre"] + ("" if r["activo"] else " (inactiva)")
                    for _, r in todos_prods.iterrows()}
-            ed_id = st.selectbox("Pieza a editar", list(ids.keys()), format_func=ids.get, key="editar_sel")
+            ed_id = st.selectbox("Pieza a editar", list(ids.keys()), format_func=ids.get, key="editar_sel",
+                help="Elige la pieza que quieres cambiar.")
             r = todos_prods[todos_prods["id"] == ed_id].iloc[0]
             with st.form(f"editar_{ed_id}"):
                 c1, c2 = st.columns(2)
-                ed_nombre = c1.text_input("Nombre", value=r["nombre"])
+                ed_nombre = c1.text_input("Nombre", value=r["nombre"],
+                    help="No puede repetirse con otra pieza.")
                 ed_cat = c2.selectbox("Categoría", CATEGORIAS,
-                                      index=CATEGORIAS.index(r["categoria"]) if r["categoria"] in CATEGORIAS else 0)
+                                      index=CATEGORIAS.index(r["categoria"]) if r["categoria"] in CATEGORIAS else 0,
+                                      help="Sirve para agrupar y filtrar el catálogo.")
                 c1, c2, c3 = st.columns(3)
-                ed_medida = c1.text_input("Medida", value=r["medida"])
-                ed_diseno = c2.text_input("Diseño / colores", value=r["diseno"])
-                ed_min = c3.number_input("Avisarme cuando queden", min_value=0, value=int(r["stock_minimo"]), step=1)
+                ed_medida = c1.text_input("Medida", value=r["medida"],
+                    help="Opcional.")
+                ed_diseno = c2.text_input("Diseño / colores", value=r["diseno"],
+                    help="Opcional.")
+                ed_min = c3.number_input("Avisarme cuando queden", min_value=0, value=int(r["stock_minimo"]), step=1,
+                    help="Cuando queden estas piezas o menos, aparece el aviso de «por acabarse».")
                 c1, c2, c3 = st.columns(3)
-                ed_costo = c1.number_input("Costo", min_value=0.0, value=float(r["costo"]), step=5.0, format="%.2f")
+                ed_costo = c1.number_input("Costo", min_value=0.0, value=float(r["costo"]), step=5.0, format="%.2f",
+                    help="Lo que cuesta hacer o comprar una pieza. Sirve para calcular la ganancia.")
                 ed_precio = c2.number_input("Precio de venta", min_value=0.0, value=float(r["precio_venta"]),
-                                            step=5.0, format="%.2f")
+                                            step=5.0, format="%.2f",
+                                            help="Cambiarlo no afecta ventas ni pedidos ya registrados.")
                 ed_mayoreo = c3.number_input("Mayoreo", min_value=0.0, value=float(r["precio_mayoreo"]),
-                                             step=5.0, format="%.2f")
-                ed_activo = st.checkbox("Activa (aparece para vender y en pedidos)", value=bool(r["activo"]))
+                                             step=5.0, format="%.2f",
+                                             help="0 = sin precio de mayoreo (se usa el normal).")
+                ed_activo = st.checkbox("Activa (aparece para vender y en pedidos)", value=bool(r["activo"]),
+                    help="Desmárcala si ya no se hace esta pieza: deja de aparecer pero conserva su historial.")
                 st.caption(f"Existencias actuales: {int(r['existencias'])}. Para cambiarlas usa "
                            "«Entraron piezas» o «Corregir conteo».")
-                confirmar = st.checkbox("Sí, quiero eliminar esta pieza del catálogo")
+                confirmar = st.checkbox("Sí, quiero eliminar esta pieza del catálogo",
+                    help="Eliminar no se puede deshacer. Si solo ya no se vende, mejor desmarca «Activa».")
                 c1, c2 = st.columns(2)
                 guardar = c1.form_submit_button("💾 Guardar cambios", use_container_width=True)
                 borrar = c2.form_submit_button("🗑️ Eliminar", use_container_width=True)
@@ -1318,10 +1505,14 @@ with tab_inventario:
         st.info("Todavía no hay piezas. Empieza dando de alta la primera arriba. 👆")
     else:
         c1, c2, c3 = st.columns([2, 2, 1])
-        f_buscar = c1.text_input("Buscar", key="inv_buscar", placeholder="Nombre o diseño")
-        f_cat = c2.multiselect("Categoría", CATEGORIAS, key="inv_cat")
-        f_bajo = c3.checkbox("Solo por acabarse", key="inv_bajo")
-        f_inactivas = c3.checkbox("Ver inactivas", key="inv_inactivas")
+        f_buscar = c1.text_input("Buscar", key="inv_buscar", placeholder="Nombre o diseño",
+            help="Escribe parte del nombre o del diseño.")
+        f_cat = c2.multiselect("Categoría", CATEGORIAS, key="inv_cat",
+            help="Déjalo vacío para ver todas.")
+        f_bajo = c3.checkbox("Solo por acabarse", key="inv_bajo",
+            help="Muestra solo las piezas en su mínimo o por debajo.")
+        f_inactivas = c3.checkbox("Ver inactivas", key="inv_inactivas",
+            help="Incluye las piezas que ya no se venden.")
         vista = todos_prods if f_inactivas else activos_prods
         if f_buscar:
             texto = vista["nombre"] + " " + vista["diseno"]
@@ -1362,12 +1553,17 @@ with tab_cuentas:
         with izq:
             with st.form("gasto", clear_on_submit=True):
                 st.markdown("**📉 Registrar gasto**")
-                g_cat = st.selectbox("Tipo de gasto", CATEGORIAS_GASTO)
-                g_concepto = st.text_input("Concepto", placeholder="Ej. 2 costales de barro")
-                g_monto = st.number_input("Monto", min_value=0.0, step=10.0, format="%.2f")
+                g_cat = st.selectbox("Tipo de gasto", CATEGORIAS_GASTO,
+                    help="Sirve para ver en qué se va el dinero en el resumen del mes.")
+                g_concepto = st.text_input("Concepto", placeholder="Ej. 2 costales de barro",
+                    help="Qué se compró o pagó, para recordarlo después.")
+                g_monto = st.number_input("Monto", min_value=0.0, step=10.0, format="%.2f",
+                    help="Cuánto se pagó en total.")
                 c1, c2 = st.columns(2)
-                g_metodo = c1.selectbox("Forma de pago", METODOS_PAGO)
-                g_fecha = c2.date_input("Fecha", value=hoy(), format="DD/MM/YYYY")
+                g_metodo = c1.selectbox("Forma de pago", METODOS_PAGO,
+                    help="Si se pagó en efectivo, se resta del efectivo del corte.")
+                g_fecha = c2.date_input("Fecha", value=hoy(), format="DD/MM/YYYY",
+                    help="Día en que se pagó.")
                 if st.form_submit_button("Guardar gasto", use_container_width=True):
                     if g_monto <= 0:
                         st.error("Escribe un monto mayor a cero.")
@@ -1380,11 +1576,15 @@ with tab_cuentas:
                 st.markdown("**📈 Registrar otro ingreso**")
                 i_cat = st.selectbox("Tipo", CATEGORIAS_INGRESO_MANUAL,
                                      help="«Venta sin inventario» es para piezas que no están en el catálogo.")
-                i_concepto = st.text_input("Concepto", placeholder="Ej. venta en feria de San Pedro")
-                i_monto = st.number_input("Monto", min_value=0.0, step=10.0, format="%.2f")
+                i_concepto = st.text_input("Concepto", placeholder="Ej. venta en feria de San Pedro",
+                    help="De dónde vino el dinero.")
+                i_monto = st.number_input("Monto", min_value=0.0, step=10.0, format="%.2f",
+                    help="Cuánto entró.")
                 c1, c2 = st.columns(2)
-                i_metodo = c1.selectbox("Forma de pago", METODOS_PAGO)
-                i_fecha = c2.date_input("Fecha", value=hoy(), format="DD/MM/YYYY")
+                i_metodo = c1.selectbox("Forma de pago", METODOS_PAGO,
+                    help="Cómo se recibió el dinero.")
+                i_fecha = c2.date_input("Fecha", value=hoy(), format="DD/MM/YYYY",
+                    help="Día en que entró.")
                 if st.form_submit_button("Guardar ingreso", use_container_width=True):
                     if i_monto <= 0:
                         st.error("Escribe un monto mayor a cero.")
@@ -1394,7 +1594,8 @@ with tab_cuentas:
                         st.rerun()
 
     with sub_corte:
-        dia = st.date_input("Día", value=hoy(), key="corte_dia", format="DD/MM/YYYY")
+        dia = st.date_input("Día", value=hoy(), key="corte_dia", format="DD/MM/YYYY",
+            help="Elige el día del que quieres ver el corte.")
         movs = consultar_df(
             "SELECT id, registrado, tipo, categoria, concepto, metodo, monto, pedido_id"
             " FROM caja WHERE fecha = %s ORDER BY registrado, id", (dia,))
@@ -1430,13 +1631,15 @@ with tab_cuentas:
                 opciones = {int(r["id"]): f"{r['categoria']} · {r['concepto'][:50]} · {dinero(r['monto'])}"
                             for _, r in movs.iterrows()}
                 borrar_id = st.selectbox("Movimiento", list(opciones.keys()), format_func=opciones.get,
-                                         key="borrar_caja_sel")
+                                         key="borrar_caja_sel",
+                                         help="Solo aparecen los movimientos del día elegido arriba.")
                 fila = movs[movs["id"] == borrar_id].iloc[0]
                 if fila["categoria"] == "Venta mostrador":
                     st.caption("Es una venta: al borrarla, las piezas regresan al inventario.")
                 elif fila["pedido_id"] is not None and not pd.isna(fila["pedido_id"]):
                     st.caption(f"Es un pago del pedido {folio(fila['pedido_id'])}: su saldo volverá a subir.")
-                seguro = st.checkbox("Sí, quiero borrarlo", key="borrar_caja_ok")
+                seguro = st.checkbox("Sí, quiero borrarlo", key="borrar_caja_ok",
+                    help="Borrar no se puede deshacer.")
                 if st.button("Borrar movimiento", disabled=not seguro):
                     eliminar_caja(borrar_id)
                     avisar("🗑️ Movimiento borrado.")
@@ -1444,7 +1647,8 @@ with tab_cuentas:
 
     with sub_mes:
         meses = meses_recientes(12)
-        mes = st.selectbox("Mes", meses, format_func=nombre_mes, key="resumen_mes")
+        mes = st.selectbox("Mes", meses, format_func=nombre_mes, key="resumen_mes",
+            help="Elige el mes que quieres revisar.")
         fin = siguiente_mes(mes)
         por_cat = consultar_df(
             "SELECT tipo, categoria, SUM(monto) AS monto FROM caja WHERE fecha >= %s AND fecha < %s"
