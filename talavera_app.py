@@ -32,8 +32,10 @@ import streamlit as st
 # 1. CONFIGURACIÓN
 # ==========================================
 NEGOCIO = os.getenv("NEGOCIO_NAME", "Talavera")
-PRIMARY_COLOR = os.getenv("PRIMARY_COLOR", "#1e3a8a")
-ACENTO = "#f59e0b"
+PRIMARY_COLOR = os.getenv("PRIMARY_COLOR", "#2869a1")  # azul del logo (tono oscuro)
+AZUL_LOGO = "#3680b9"                                  # azul del fondo del logo
+AZUL_OSCURO = "#1d4f7c"
+ACENTO = "#9cc8e8"                                     # azul claro para gastos y detalles
 ROJO = "#dc2626"
 ZONA = ZoneInfo(os.getenv("ZONA_HORARIA", "America/Mexico_City"))
 SESION_MINUTOS = int(os.getenv("SESION_MINUTOS", "30"))
@@ -59,8 +61,16 @@ PERSONALIZADA = "✏️ Pieza personalizada"
 st.markdown(
     f"""
     <style>
-    .stApp {{ background-color: #f8fafc; }}
-    [data-testid="stSidebar"] {{ background-color: #ffffff; border-right: 1px solid #e2e8f0; }}
+    .stApp {{ background-color: #f5f9fc; }}
+    [data-testid="stSidebar"] {{ background-color: #ffffff; border-right: 3px solid {AZUL_LOGO}; }}
+    div.stButton > button[kind="primary"], div.stFormSubmitButton > button {{
+        background-color: {PRIMARY_COLOR}; border-color: {PRIMARY_COLOR}; color: #ffffff;
+    }}
+    div.stButton > button[kind="primary"]:hover, div.stFormSubmitButton > button:hover {{
+        background-color: {AZUL_OSCURO}; border-color: {AZUL_OSCURO}; color: #ffffff;
+    }}
+    .stTabs [aria-selected="true"] {{ color: {PRIMARY_COLOR} !important; }}
+    .stTabs [data-baseweb="tab-highlight"] {{ background-color: {PRIMARY_COLOR} !important; }}
     [data-testid="stMetric"], [data-testid="metric-container"] {{
         background-color: #ffffff; border: 1px solid #e2e8f0; padding: 14px;
         border-radius: 12px; box-shadow: 0 1px 3px rgba(0,0,0,0.05);
@@ -69,7 +79,7 @@ st.markdown(
     div.stButton > button, div.stFormSubmitButton > button {{ min-height: 2.8rem; border-radius: 10px; }}
     .franja-talavera {{
         height: 10px; border-radius: 6px; margin: -0.5rem 0 1rem 0;
-        background: repeating-linear-gradient(90deg, {PRIMARY_COLOR} 0 22px, #ffffff 22px 28px,
+        background: repeating-linear-gradient(90deg, {AZUL_LOGO} 0 22px, #ffffff 22px 28px,
                     {ACENTO} 28px 34px, #ffffff 34px 40px);
     }}
     </style>
@@ -542,12 +552,16 @@ if not st.session_state.autenticado:
         f"""
         <style>
         #MainMenu {{visibility: hidden;}} footer {{visibility: hidden;}}
-        .stApp {{ background: linear-gradient(135deg, #0b1f4d 0%, {PRIMARY_COLOR} 50%, #0b1f4d 100%); }}
-        div.block-container {{ padding-top: 4rem; }}
+        .stApp {{ background: linear-gradient(180deg, #ffffff 0%, #eef5fb 100%); }}
+        div.block-container {{ padding-top: 3rem; }}
+        .logo-login {{
+            width: 170px; max-width: 55vw; border-radius: 24px; border: 6px solid #ffffff;
+            box-shadow: 0 14px 34px rgba(29, 79, 124, 0.35);
+        }}
         div[data-testid="stForm"] {{
-            background: rgba(255,255,255,0.97) !important; border-radius: 20px !important;
-            padding: 2rem !important; box-shadow: 0 20px 40px rgba(0,0,0,0.35) !important;
-            border-top: 8px solid {ACENTO} !important;
+            background: #ffffff !important; border-radius: 18px !important;
+            padding: 1.8rem !important; box-shadow: 0 8px 24px rgba(29, 79, 124, 0.12) !important;
+            border: 1px solid #dbe8f3 !important;
         }}
         div.stFormSubmitButton > button {{
             background: {PRIMARY_COLOR} !important; color: #fff !important; border: none !important;
@@ -565,13 +579,14 @@ if not st.session_state.autenticado:
             with open(LOGO, "rb") as f:
                 logo64 = base64.b64encode(f.read()).decode("utf-8")
             st.markdown(
-                f"<div style='display:flex;justify-content:center;margin-bottom:0.8rem;'>"
-                f"<img src='data:{LOGO_MIME};base64,{logo64}' width='105' style='border-radius:16px;'></div>",
+                f"<div style='display:flex;justify-content:center;margin-bottom:1.2rem;'>"
+                f"<img class='logo-login' src='data:{LOGO_MIME};base64,{logo64}'></div>",
                 unsafe_allow_html=True,
             )
         st.markdown(
-            f"<h1 style='text-align:center;color:#fff;font-size:1.9rem;margin-bottom:0.2rem;'>🏺 {NEGOCIO}</h1>"
-            "<p style='text-align:center;color:#cbd5e1;margin-bottom:1.5rem;'>Control del taller</p>",
+            f"<h1 style='text-align:center;color:{AZUL_OSCURO};font-size:1.9rem;margin-bottom:0.2rem;'>"
+            f"{NEGOCIO}</h1>"
+            "<p style='text-align:center;color:#5b7a95;margin-bottom:1.3rem;'>Control del taller</p>",
             unsafe_allow_html=True,
         )
         with st.form("login_form"):
