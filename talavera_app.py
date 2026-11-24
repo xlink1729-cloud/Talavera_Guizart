@@ -50,9 +50,9 @@ CATEGORIAS = ["Platos", "Jarrones", "Macetas", "Tazas y jarras", "Azulejos",
               "Lavabos", "Figuras", "Servicio de mesa", "Otro"]
 METODOS_PAGO = ["Efectivo", "Transferencia", "Tarjeta"]
 ESTADOS_PEDIDO = ["Pendiente", "En producción", "Listo para entregar", "Entregado", "Cancelado"]
-CATEGORIAS_GASTO = ["Barro y materia prima", "Esmaltes y pintura", "Gas / horno", "Sueldos",
-                    "Renta", "Luz y agua", "Empaque", "Transporte", "Devolución a cliente",
-                    "Otro gasto"]
+CATEGORIAS_GASTO = ["Barro y materia prima", "Esmaltes y pintura", "Luz (recibo CFE)",
+                    "Mantenimiento del horno", "Sueldos", "Renta", "Agua", "Empaque", "Transporte",
+                    "Devolución a cliente", "Otro gasto"]
 CATEGORIAS_INGRESO_MANUAL = ["Venta sin inventario", "Otro ingreso"]
 PERSONALIZADA = "✏️ Pieza personalizada"
 
