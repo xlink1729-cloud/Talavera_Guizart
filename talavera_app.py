@@ -15,7 +15,10 @@ Variables de entorno:
 import base64
 import hashlib
 import hmac
+import io
 import os
+import threading
+import time
 from contextlib import contextmanager
 from datetime import date, datetime, timedelta
 from decimal import Decimal
@@ -31,8 +34,8 @@ import streamlit as st
 # ==========================================
 # 1. CONFIGURACIÓN
 # ==========================================
-NEGOCIO = os.getenv("NEGOCIO_NAME", "Talavera")
-PRIMARY_COLOR = os.getenv("PRIMARY_COLOR", "#2869a1")  # azul del logo (tono oscuro)
+NEGOCIO = os.getenv("NEGOCIO_NAME")
+PRIMARY_COLOR = os.getenv("PRIMARY_COLOR")  # azul del logo (tono oscuro)
 AZUL_LOGO = "#3680b9"                                  # azul del fondo del logo
 AZUL_OSCURO = "#1d4f7c"
 ACENTO = "#9cc8e8"                                     # azul claro para gastos y detalles
@@ -525,6 +528,101 @@ def resumen_lineas(lineas):
 
 DINERO_COL = st.column_config.NumberColumn(format="$%.2f")
 
+
+# ==========================================
+# 5b. SEGURIDAD: LÍMITE DE INTENTOS DE ACCESO
+# ==========================================
+MAX_INTENTOS = 5            # fallos seguidos antes de bloquear a ese dispositivo
+BLOQUEO_BASE_MIN = 5        # primer bloqueo: 5 min; luego 10, 20, 40... hasta 60
+BLOQUEO_MAX_MIN = 60
+LIMITE_GLOBAL = 25          # si hay 25 fallos en total en 15 min, se pausa el acceso para todos
+VENTANA_GLOBAL_SEG = 15 * 60
+
+
+@st.cache_resource
+def _registro_intentos():
+    """Compartido entre todas las sesiones del servidor (no se borra al recargar la página)."""
+    return {"candado": threading.Lock(), "clientes": {}, "fallos_globales": []}
+
+
+def _clave_cliente() -> str:
+    try:
+        h = st.context.headers
+        return (h.get("X-Forwarded-For") or h.get("X-Real-Ip") or "local").strip()
+    except Exception:
+        return "local"
+
+
+def segundos_bloqueo(clave: str) -> int:
+    reg = _registro_intentos()
+    ahora = time.time()
+    with reg["candado"]:
+        reg["fallos_globales"] = [t for t in reg["fallos_globales"] if ahora - t < VENTANA_GLOBAL_SEG]
+        restante = reg["clientes"].get(clave, {}).get("bloqueado_hasta", 0) - ahora
+        if len(reg["fallos_globales"]) >= LIMITE_GLOBAL:
+            restante = max(restante, reg["fallos_globales"][0] + VENTANA_GLOBAL_SEG - ahora)
+    return max(0, int(restante))
+
+
+def registrar_fallo(clave: str) -> int:
+    """Anota un intento fallido. Regresa cuántos intentos le quedan antes del bloqueo."""
+    reg = _registro_intentos()
+    ahora = time.time()
+    with reg["candado"]:
+        reg["fallos_globales"].append(ahora)
+        c = reg["clientes"].setdefault(clave, {"fallos": 0, "bloqueos": 0, "bloqueado_hasta": 0})
+        c["fallos"] += 1
+        if c["fallos"] >= MAX_INTENTOS:
+            minutos = min(BLOQUEO_BASE_MIN * 2 ** c["bloqueos"], BLOQUEO_MAX_MIN)
+            c["bloqueado_hasta"] = ahora + minutos * 60
+            c["bloqueos"] += 1
+            c["fallos"] = 0
+            return 0
+        return MAX_INTENTOS - c["fallos"]
+
+
+def registrar_exito(clave: str):
+    reg = _registro_intentos()
+    with reg["candado"]:
+        reg["clientes"].pop(clave, None)
+
+
+def texto_espera(segundos: int) -> str:
+    minutos = (segundos + 59) // 60
+    return f"{minutos} minuto{'s' if minutos != 1 else ''}"
+
+
+# ==========================================
+# 5c. RESPALDO EN EXCEL
+# ==========================================
+HOJAS_RESPALDO = {
+    "Piezas": "SELECT id, nombre, categoria, medida, diseno, existencias, stock_minimo, costo,"
+              " precio_venta, precio_mayoreo, activo, creado FROM productos ORDER BY id",
+    "Pedidos": SQL_PEDIDOS + " ORDER BY p.id",
+    "Detalle de pedidos": "SELECT d.pedido_id, p.cliente, d.producto_id, d.descripcion, d.cantidad,"
+                          " d.precio_unitario, d.cantidad * d.precio_unitario AS subtotal"
+                          " FROM pedido_detalle d JOIN pedidos p ON p.id = d.pedido_id ORDER BY d.pedido_id, d.id",
+    "Caja": "SELECT id, fecha, tipo, categoria, concepto, monto, metodo, pedido_id, registrado"
+            " FROM caja ORDER BY fecha, id",
+    "Movimientos de piezas": "SELECT id, fecha, tipo, producto_id, nombre_producto, cantidad, costo_unitario,"
+                             " precio_unitario, nota, caja_id, registrado FROM movimientos_inventario"
+                             " ORDER BY fecha, id",
+}
+
+
+def generar_respaldo() -> bytes:
+    salida = io.BytesIO()
+    with pd.ExcelWriter(salida, engine="openpyxl") as excel:
+        for hoja, sql in HOJAS_RESPALDO.items():
+            df = consultar_df(sql)
+            df.to_excel(excel, sheet_name=hoja, index=False)
+            ws = excel.sheets[hoja]
+            ws.freeze_panes = "A2"
+            for i, col in enumerate(df.columns, start=1):
+                largo = max([len(str(col))] + [len(str(v)) for v in df[col].head(200)])
+                ws.column_dimensions[ws.cell(row=1, column=i).column_letter].width = min(max(10, largo + 2), 45)
+    return salida.getvalue()
+
 # ==========================================
 # 6. ACCESO
 # ==========================================
@@ -593,12 +691,25 @@ if not st.session_state.autenticado:
             pwd = st.text_input("Contraseña", type="password", placeholder="••••••••",
                                 label_visibility="collapsed")
             if st.form_submit_button("Entrar", use_container_width=True):
-                if hmac.compare_digest(hash_password(pwd), ADMIN_PASSWORD_HASH):
+                cliente_login = _clave_cliente()
+                espera = segundos_bloqueo(cliente_login)
+                if espera > 0:
+                    st.error(f"🔒 Demasiados intentos fallidos. Espera {texto_espera(espera)} y vuelve a intentar.")
+                elif hmac.compare_digest(hash_password(pwd), ADMIN_PASSWORD_HASH):
+                    registrar_exito(cliente_login)
                     st.session_state.autenticado = True
                     st.session_state.ultimo_acceso = datetime.now()
                     st.rerun()
                 else:
-                    st.error("❌ Contraseña incorrecta.")
+                    time.sleep(1)  # frena a quien intente adivinar en automático
+                    quedan = registrar_fallo(cliente_login)
+                    if quedan == 0:
+                        st.error("🔒 Demasiados intentos fallidos. El acceso se bloqueó unos minutos.")
+                    elif quedan <= 2:
+                        st.error(f"❌ Contraseña incorrecta. Te queda{'n' if quedan > 1 else ''} {quedan} "
+                                 f"intento{'s' if quedan > 1 else ''}.")
+                    else:
+                        st.error("❌ Contraseña incorrecta.")
     st.stop()
 
 # ==========================================
@@ -609,6 +720,17 @@ with st.sidebar:
         st.image(LOGO, width=110)
     st.markdown(f"### 🏺 {NEGOCIO}")
     st.toggle("🙈 Ocultar cifras", key="ocultar_cifras")
+    st.markdown("---")
+    st.markdown("**💾 Respaldo**")
+    st.caption("Descarga un Excel con todo (piezas, pedidos y caja). Guárdalo cada semana.")
+    if st.button("Preparar respaldo", use_container_width=True):
+        with st.spinner("Preparando..."):
+            st.session_state.respaldo = (generar_respaldo(), datetime.now(ZONA).strftime("%Y-%m-%d_%H%M"))
+    if "respaldo" in st.session_state:
+        datos_respaldo, sello = st.session_state.respaldo
+        st.download_button("⬇️ Descargar Excel", data=datos_respaldo, file_name=f"respaldo_talavera_{sello}.xlsx",
+                           mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                           use_container_width=True, type="primary")
     st.markdown("---")
     if st.button("🚪 Cerrar sesión", use_container_width=True):
         st.session_state.clear()
